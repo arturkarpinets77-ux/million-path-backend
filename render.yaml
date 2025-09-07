@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: million-path-backend
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: APP_TOKEN
+        sync: false
+      - key: TRADE_MODE
+        value: paper
+      - key: QUOTE_ASSET
+        value: USDC
+      - key: LIVE_ENABLED
+        value: "false"
