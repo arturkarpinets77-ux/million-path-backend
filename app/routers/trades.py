@@ -1,194 +1,223 @@
-# app/routers/trades.py
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel
+from pathlib import Path
+import json, time, os
 from datetime import datetime, timezone
-from ..core.storage import load_json, save_json
-from .settings import SETTINGS_FILE, STATE_FILE, SettingsModel, _read_state, _write_state, _compute_effective
 
-router = APIRouter(tags=["trades"])
+router = APIRouter(prefix="/trades", tags=["trades"])
 
-OPEN_FILE = "open_trades.json"
-CLOSED_FILE = "closed_trades.json"
+# ---- storage helpers
+ROOT = Path(__file__).resolve().parents[1]  # .../app
+DB = ROOT / "db"
+DB.mkdir(exist_ok=True)
 
-class TradeOpen(BaseModel):
-    id: str
-    symbol: str
-    side: str                # BUY / SELL
-    qty: float
-    entry_price: float
-    notional_usdc: float
-    entry_time: str          # ISO8601
+F_OPEN   = DB / "trades_open.json"
+F_CLOSED = DB / "trades_closed.json"
+F_SUM    = DB / "trades_summary.json"
+F_SET    = DB / "settings.json"
 
-class TradeClosed(BaseModel):
-    id: str
-    symbol: str
-    side: str
-    qty: float
-    entry_price: float
-    exit_price: float
-    pnl_usdc: float
-    pnl_pct: float
-    entry_time: str
-    exit_time: str
-    duration_sec: float
+def _read_json(p: Path, default):
+    if not p.exists():
+        return default
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-class TradesSummary(BaseModel):
-    open_count: int
-    closed_count: int
-    realized_pnl_usdc_total: float
-    realized_pnl_usdc_today: float
-    win_rate: float
-    avg_pnl_usdc: float
-    max_drawdown_usdc: float
-    base_exposure_usdc: float
-    adjustment_usdc: float
-    effective_max_usdc_exposure: float
-    reinvest_profit_pct: float
+def _write_json(p: Path, data):
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def _utcnow_iso() -> str:
+def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def _load_list(name: str) -> List[Dict[str, Any]]:
-    return load_json(name, [])
+def _today_str(dt: datetime | None = None):
+    d = dt or datetime.now(timezone.utc)
+    return d.strftime("%Y-%m-%d")
 
-def _save_list(name: str, data: List[Dict[str, Any]]) -> None:
-    save_json(name, data)
+# ---- auth
+def _auth_ok(authorization: str | None) -> bool:
+    if not authorization: 
+        return False
+    if not authorization.lower().startswith("bearer "):
+        return False
+    token = authorization.split(" ", 1)[1]
+    expected = os.getenv("APP_TOKEN", "MySecret123")
+    return token == expected
 
-def _load_settings() -> SettingsModel:
-    raw = load_json(SETTINGS_FILE, {})
-    return SettingsModel(**raw)
-
-@router.get("/trades/open", response_model=List[TradeOpen])
-async def get_open():
-    return _load_list(OPEN_FILE)
-
-@router.get("/trades/closed", response_model=List[TradeClosed])
-async def get_closed(limit: int = 200):
-    lst = _load_list(CLOSED_FILE)
-    lst.sort(key=lambda x: x.get("exit_time",""), reverse=True)
-    return lst[: max(1, min(limit, 1000))]
-
-@router.get("/trades/summary", response_model=TradesSummary)
-async def get_summary():
-    open_tr = _load_list(OPEN_FILE)
-    closed_tr = _load_list(CLOSED_FILE)
-    s = _load_settings()
-    st = _read_state()
-
-    total = sum(float(x.get("pnl_usdc", 0.0)) for x in closed_tr)
-    # pnl сегодня (UTC по дате закрытия)
-    today = datetime.now(timezone.utc).date()
-    today_pnl = 0.0
-    wins = 0
-    for x in closed_tr:
-        try:
-            dt = datetime.fromisoformat(x.get("exit_time"))
-            if dt.date() == today:
-                today_pnl += float(x.get("pnl_usdc", 0.0))
-        except Exception:
-            pass
-        if float(x.get("pnl_usdc", 0.0)) > 0:
-            wins += 1
-
-    win_rate = (wins / len(closed_tr)) * 100.0 if closed_tr else 0.0
-    avg_pnl = (total / len(closed_tr)) if closed_tr else 0.0
-
-    # простая оценка max drawdown по кум. кривой
-    cum = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for x in closed_tr:
-        cum += float(x.get("pnl_usdc", 0.0))
-        peak = max(peak, cum)
-        max_dd = min(max_dd, cum - peak)
-
-    eff = _compute_effective(s, st)
-    return TradesSummary(
-        open_count=len(open_tr),
-        closed_count=len(closed_tr),
-        realized_pnl_usdc_total=round(total, 8),
-        realized_pnl_usdc_today=round(today_pnl, 8),
-        win_rate=round(win_rate, 2),
-        avg_pnl_usdc=round(avg_pnl, 8),
-        max_drawdown_usdc=round(max_dd, 8),
-        base_exposure_usdc=s.max_usdc_exposure,
-        adjustment_usdc=float(st.get("exposure_adjustment_usdc", 0.0)),
-        effective_max_usdc_exposure=eff,
-        reinvest_profit_pct=s.reinvest_profit_pct
-    )
-
-# ---- Ниже 2 endpoint'а для записи/закрытия сделок (чтобы можно было тестировать) ----
-
+# ---- models
 class PostOpen(BaseModel):
     id: str
     symbol: str
-    side: str
+    side: str        # BUY / SELL
     qty: float
     entry_price: float
     notional_usdc: float
-    entry_time: Optional[str] = None
-
-@router.post("/trades/open", response_model=TradeOpen)
-async def post_open(p: PostOpen):
-    o = p.dict()
-    if not o.get("entry_time"):
-        o["entry_time"] = _utcnow_iso()
-    open_tr = _load_list(OPEN_FILE)
-    if any(x.get("id")==o["id"] for x in open_tr):
-        raise HTTPException(400, "id already exists")
-    open_tr.append(o)
-    _save_list(OPEN_FILE, open_tr)
-    return o
 
 class PostClose(BaseModel):
     id: str
     exit_price: float
-    exit_time: Optional[str] = None
 
-@router.post("/trades/close", response_model=TradeClosed)
-async def post_close(p: PostClose):
-    open_tr = _load_list(OPEN_FILE)
-    idx = next((i for i,x in enumerate(open_tr) if x.get("id")==p.id), None)
-    if idx is None:
-        raise HTTPException(404, "open trade not found")
-    o = open_tr.pop(idx)
-    _save_list(OPEN_FILE, open_tr)
+# ---- helpers for settings/exposure
+def _load_settings():
+    s = _read_json(F_SET, {})
+    # sane defaults
+    s.setdefault("max_usdc_exposure", 100.0)
+    s.setdefault("reinvest_profit_pct", 0.0)
+    s.setdefault("auto_adjust_exposure", True)
+    return s
 
-    # формируем закрытую
-    exit_time = p.exit_time or _utcnow_iso()
-    qty = float(o["qty"])
-    entry = float(o["entry_price"])
-    exitp = float(p.exit_price)
-    side = o["side"].upper()
-    # PnL по направлению
-    diff = (exitp - entry) if side=="BUY" else (entry - exitp)
-    pnl_usdc = diff * qty
-    pnl_pct = (diff / entry) * 100.0 if entry else 0.0
-
-    c = {
-        "id": o["id"], "symbol": o["symbol"], "side": side, "qty": qty,
-        "entry_price": entry, "exit_price": exitp,
-        "pnl_usdc": pnl_usdc, "pnl_pct": pnl_pct,
-        "entry_time": o["entry_time"], "exit_time": exit_time,
-        "duration_sec": max(0.0, (datetime.fromisoformat(exit_time) - datetime.fromisoformat(o["entry_time"])).total_seconds())
-    }
-    closed_tr = _load_list(CLOSED_FILE)
-    closed_tr.append(c)
-    _save_list(CLOSED_FILE, closed_tr)
-
-    # авто-коррекция экспозиции
+def _load_summary_default():
     s = _load_settings()
-    st = _read_state()
-    adj = float(st.get("exposure_adjustment_usdc", 0.0))
-    if s.auto_adjust_exposure:
-        if pnl_usdc > 0:
-            adj += pnl_usdc * (float(s.reinvest_profit_pct)/100.0)
-        else:
-            adj += pnl_usdc  # убыток вычитаем полностью (отрицательное число)
-        st["exposure_adjustment_usdc"] = adj
-        st["realized_pnl_total_usdc"] = float(st.get("realized_pnl_total_usdc", 0.0)) + pnl_usdc
-        _write_state(st)
+    return {
+        "open_count": 0,
+        "closed_count": 0,
+        "realized_pnl_usdc_total": 0.0,
+        "realized_pnl_usdc_today": 0.0,
+        "win_rate": 0.0,
+        "avg_pnl_usdc": 0.0,
+        "max_drawdown_usdc": 0.0,
+        "base_exposure_usdc": s["max_usdc_exposure"],
+        "adjustment_usdc": 0.0,
+        "effective_max_usdc_exposure": s["max_usdc_exposure"],
+        "reinvest_profit_pct": s["reinvest_profit_pct"],
+        "today": _today_str(),
+    }
 
-    return c
+def _recalc_summary(open_list, closed_list):
+    s = _read_json(F_SUM, _load_summary_default())
+    # базовые из настроек (могли измениться)
+    sets = _load_settings()
+    s["base_exposure_usdc"] = sets["max_usdc_exposure"]
+    s["reinvest_profit_pct"] = sets["reinvest_profit_pct"]
+
+    s["open_count"] = len(open_list)
+    s["closed_count"] = len(closed_list)
+
+    total = sum(x.get("pnl_usdc", 0.0) for x in closed_list)
+    s["realized_pnl_usdc_total"] = round(total, 6)
+
+    today = _today_str()
+    s["realized_pnl_usdc_today"] = round(
+        sum(x.get("pnl_usdc", 0.0) for x in closed_list if x.get("exit_time","")[:10] == today), 6
+    )
+
+    wins = sum(1 for x in closed_list if x.get("pnl_usdc", 0.0) > 0)
+    s["win_rate"] = round(100.0 * wins / max(1, len(closed_list)), 2)
+
+    s["avg_pnl_usdc"] = round(total / max(1, len(closed_list)), 6)
+
+    # max drawdown: упрощённо — минимальная накопленная кумулятивная доходность
+    cum, min_cum = 0.0, 0.0
+    for x in closed_list:
+        cum += x.get("pnl_usdc", 0.0)
+        min_cum = min(min_cum, cum)
+    s["max_drawdown_usdc"] = round(-min_cum, 6)
+
+    s["effective_max_usdc_exposure"] = round(s["base_exposure_usdc"] + s["adjustment_usdc"], 6)
+
+    _write_json(F_SUM, s)
+    return s
+
+# ---- GET endpoints
+@router.get("/open")
+def get_open_trades(authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    return _read_json(F_OPEN, [])
+
+@router.get("/closed")
+def get_closed_trades(limit: int = 200, authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    arr = _read_json(F_CLOSED, [])
+    return arr[-limit:]
+
+@router.get("/summary")
+def get_summary(authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    open_list = _read_json(F_OPEN, [])
+    closed_list = _read_json(F_CLOSED, [])
+    return _recalc_summary(open_list, closed_list)
+
+# ---- POST open/close
+@router.post("/open")
+def post_open(body: PostOpen, authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    open_list = _read_json(F_OPEN, [])
+    # forbid duplicate IDs
+    if any(x["id"] == body.id for x in open_list):
+        raise HTTPException(400, detail="id already open")
+    now = _now_iso()
+    row = {
+        "id": body.id,
+        "symbol": body.symbol.upper(),
+        "side": body.side.upper(),
+        "qty": float(body.qty),
+        "entry_price": float(body.entry_price),
+        "notional_usdc": float(body.notional_usdc),
+        "entry_time": now
+    }
+    open_list.append(row)
+    _write_json(F_OPEN, open_list)
+    # update summary counters (open_count)
+    _recalc_summary(open_list, _read_json(F_CLOSED, []))
+    return row
+
+@router.post("/close")
+def post_close(body: PostClose, authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    open_list = _read_json(F_OPEN, [])
+    idx = next((i for i,x in enumerate(open_list) if x["id"] == body.id), None)
+    if idx is None:
+        raise HTTPException(404, detail="id not found")
+    row = open_list.pop(idx)
+    exit_time = _now_iso()
+    side = row["side"]
+    qty = float(row["qty"])
+    entry = float(row["entry_price"])
+    exitp = float(body.exit_price)
+
+    # pnl BUY = q*(exit-entry); SELL = q*(entry-exit)
+    pnl = qty * (exitp - entry) if side == "BUY" else qty * (entry - exitp)
+    pnl_pct = 0.0
+    if row["notional_usdc"] > 0:
+        pnl_pct = 100.0 * pnl / float(row["notional_usdc"])
+
+    closed_row = {
+        **row,
+        "exit_price": exitp,
+        "pnl_usdc": round(pnl, 6),
+        "pnl_pct": round(pnl_pct, 4),
+        "exit_time": exit_time,
+        "duration_sec": round(
+            max(0.0, datetime.fromisoformat(exit_time).timestamp() - datetime.fromisoformat(row["entry_time"]).timestamp()), 3
+        )
+    }
+    closed_list = _read_json(F_CLOSED, [])
+    closed_list.append(closed_row)
+    _write_json(F_OPEN, open_list)
+    _write_json(F_CLOSED, closed_list)
+
+    # adjust exposure if enabled
+    summary = _read_json(F_SUM, _load_summary_default())
+    sets = _load_settings()
+    if sets.get("auto_adjust_exposure", True):
+        if pnl >= 0:
+            k = float(sets.get("reinvest_profit_pct", 0.0)) / 100.0
+            summary["adjustment_usdc"] = round(float(summary.get("adjustment_usdc", 0.0)) + pnl * k, 6)
+        else:
+            summary["adjustment_usdc"] = round(float(summary.get("adjustment_usdc", 0.0)) + pnl, 6)  # pnl < 0
+
+    _write_json(F_SUM, summary)
+    _recalc_summary(open_list, closed_list)
+    return closed_row
+
+# ---- RESET everything
+@router.post("/reset")
+def post_reset(authorization: str | None = Header(default=None)):
+    if not _auth_ok(authorization): raise HTTPException(401)
+    _write_json(F_OPEN, [])
+    _write_json(F_CLOSED, [])
+    _write_json(F_SUM, _load_summary_default())
+    return {"ok": True, "note": "trades cleared"}
